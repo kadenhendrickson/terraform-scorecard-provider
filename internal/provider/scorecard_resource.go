@@ -39,7 +39,7 @@ type scorecardModel struct {
     Name        				types.String `tfsdk:"name"`
 	Type        				types.String `tfsdk:"type"`
 	EntityFilterType 			types.String `tfsdk:"entity_filter_type"`
-	EvalutionFrequency 			types.Number `tfsdk:"evaluation_frequency"`
+	EvaluationFrequency 			types.Number `tfsdk:"evaluation_frequency"`
 	
 	// Conditionally required fields for levels based scorecards
 	EmptyLevelLabel 			types.String `tfsdk:"empty_level_label"`
@@ -84,7 +84,7 @@ type checkModel struct {
 	
 	OutputType 			types.String `tfsdk:"output_type"`
 	OutputAggregation 	types.String `tfsdk:"output_aggregation"`
-	OutputCustomOptions types.String `tfsdk:"output_custom_options"`
+	OutputCustomOptions types.String `tfsdk:"output_custom_options"` //TODO figure out how to model this
 
 	EstimatedDevDays 	types.Number `tfsdk:"estimated_dev_days"`
 	ExternalUrl			types.String `tfsdk:"external_url"`
@@ -102,35 +102,184 @@ type checkModel struct {
 
 
 func (r *scorecardResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
-	resp.TypeName = req.ProviderTypeName + "_example"
+	resp.TypeName = req.ProviderTypeName + "_scorecard"
 }
 
-func (r *scorecardResource) Schema(ctx context.Context, req resource.SchemaRequest, resp *resource.SchemaResponse) {
+func (r *scorecardResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		// This description is used by the documentation generator and the language server.
-		MarkdownDescription: "Example resource",
-
+		Description: "Manages a DX Scorecard.",
 		Attributes: map[string]schema.Attribute{
-			"configurable_attribute": schema.StringAttribute{
-				MarkdownDescription: "Example configurable attribute",
-				Optional:            true,
-			},
-			"defaulted": schema.StringAttribute{
-				MarkdownDescription: "Example configurable attribute with default value",
-				Optional:            true,
-				Computed:            true,
-				Default:             stringdefault.StaticString("example value when not configured"),
-			},
 			"id": schema.StringAttribute{
-				Computed:            true,
-				MarkdownDescription: "Example identifier",
+				Computed:    true,
+				Description: "The unique ID of the scorecard.",
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"name": schema.StringAttribute{
+				Optional:    true,
+				Description: "The name of the scorecard.",
+			},
+			"type": schema.StringAttribute{
+				Optional:    true,
+				Description: "The type of scorecard. Options: 'LEVEL', 'POINTS'.",
+				Validators: []validator.String{
+					stringvalidator.OneOf("LEVEL", "POINTS"),
+				},
+				
+			},
+			"entity_filter_type": schema.StringAttribute{
+				Optional:    true,
+				Description: "The filtering strategy when deciding what entities this scorecard should assess. Options: 'entity_types', 'sql'",
+				Validators: []validator.String{
+					stringvalidator.OneOf("entity_types", "sql"),
+				},
+			},
+			"evaluation_frequency": schema.NumberAttribute{
+				Optional:    true,
+				Description: "How often the scorecard is evaluated (in hours). [2|4|8|24]",
+				Validators: []validator.Number{
+					numbervalidator.OneOf(2, 4, 8, 24),
+				},
+			},
+
+			// Conditionally required for levels-based scorecards
+			"empty_level_label": schema.StringAttribute{
+				Optional:    true,
+				Description: "The label to display when an entity has not achieved any levels in the scorecard (levels scorecards only).",
+			},
+			"empty_level_color": schema.StringAttribute{
+				Optional:    true,
+				Description: "The color hex code to display when an entity has not achieved any levels in the scorecard (levels scorecards only).",
+			},
+			"levels": schema.ListNestedAttribute{
+				Optional:    true,
+				Description: "The levels that can be achieved in this scorecard (levels scorecards only).",
+				NestedObject: schema.NestedAttributeObject{
+					Attributes: map[string]schema.Attribute{
+						"key":   schema.StringAttribute{Required: true},
+						"id":    schema.StringAttribute{Computed: true},
+						"name":  schema.StringAttribute{Required: true},
+						"color": schema.StringAttribute{Required: true},
+						"rank":  schema.NumberAttribute{Required: true},
+					},
+				},
+			},
+
+			// Conditionally required for points-based scorecards
+			"check_groups": schema.ListNestedAttribute{
+				Optional:    true,
+				Description: "Groups of checks, to help organize the scorecard for entity owners (points scorecards only).",
+				NestedObject: schema.NestedAttributeObject{
+					Attributes: map[string]schema.Attribute{
+						"key":      schema.StringAttribute{Required: true},
+						"id":       schema.StringAttribute{Computed: true},
+						"name":     schema.StringAttribute{Required: true},
+						"ordering": schema.NumberAttribute{Required: true},
+					},
+				},
+			},
+
+			// Optional metadata
+			"description": schema.StringAttribute{
+				Optional:    true,
+				Description: "Description of the scorecard.",
+			},
+			"published": schema.BoolAttribute{
+				Optional:    true,
+				Description: "Whether the scorecard is published.",
+			},
+			"entity_filter_type_identifiers": schema.ListAttribute{
+				Optional:    true,
+				ElementType: types.StringType,
+				Description: "List of entity type identifiers that the scorecard should run against.",
+			},
+			"entity_filter_sql": schema.StringAttribute{
+				Optional:    true,
+				Description: "Custom SQL used to filter entities that the scorecard should run against.",
+			},
+
+			// For now, all check field are required. This may change in the future.
+			"checks": schema.ListNestedAttribute{
+				Optional:    true,
+				Description: "List of checks that are applied to entities in the scorecard.",
+				NestedObject: schema.NestedAttributeObject{
+					Attributes: map[string]schema.Attribute{
+						"id":               schema.StringAttribute{Computed: true},
+						"name":             schema.StringAttribute{Required: true},
+						"description":      schema.StringAttribute{Required: true},
+						"ordering":         schema.NumberAttribute{Required: true},
+						"sql":              schema.StringAttribute{Required: true},
+						"filter_sql":       schema.StringAttribute{Required: true},
+						"filter_message":   schema.StringAttribute{Required: true},
+						"output_enabled":   schema.BoolAttribute{Required: true},
+						"output_type":      schema.StringAttribute{Required: true},
+						"output_aggregation": schema.StringAttribute{Required: true},
+						"output_custom_options": schema.StringAttribute{Required: true}, // JSON string (you may eventually want to use a map)
+						"estimated_dev_days":    schema.NumberAttribute{Required: true},
+						"external_url":          schema.StringAttribute{Required: true},
+						"published":             schema.BoolAttribute{Required: true},
+
+						// Fields for level-based scorecards
+						"scorecard_level_key": schema.StringAttribute{Optional: true},
+						"level": schema.SingleNestedAttribute{
+							Optional: true,
+							Attributes: map[string]schema.Attribute{
+								"key":   schema.StringAttribute{Required: true},
+								"id":    schema.StringAttribute{Computed: true},
+								"name":  schema.StringAttribute{Required: true},
+								"color": schema.StringAttribute{Required: true},
+								"rank":  schema.NumberAttribute{Required: true},
+							},
+						},
+
+						// Fields for points-based scorecards
+						"scorecard_check_group_key": schema.StringAttribute{Optional: true},
+						"check_group": schema.SingleNestedAttribute{
+							Optional: true,
+							Description: "Optional check group. If provided, all its fields (except 'id') are required.",
+							Attributes: map[string]schema.Attribute{
+								"key":      schema.StringAttribute{Required: true},
+								"id":       schema.StringAttribute{Computed: true},
+								"name":     schema.StringAttribute{Required: true},
+								"ordering": schema.NumberAttribute{Required: true},
+							},
+						},
+						"points": schema.NumberAttribute{Optional: true},
+					},
 				},
 			},
 		},
 	}
 }
+
+
+// func (r *scorecardResource) Schema(ctx context.Context, req resource.SchemaRequest, resp *resource.SchemaResponse) {
+// 	resp.Schema = schema.Schema{
+// 		// This description is used by the documentation generator and the language server.
+// 		MarkdownDescription: "Manages a DX Scorecard",
+
+// 		Attributes: map[string]schema.Attribute{
+// 			"configurable_attribute": schema.StringAttribute{
+// 				MarkdownDescription: "Example configurable attribute",
+// 				Optional:            true,
+// 			},
+// 			"defaulted": schema.StringAttribute{
+// 				MarkdownDescription: "Example configurable attribute with default value",
+// 				Optional:            true,
+// 				Computed:            true,
+// 				Default:             stringdefault.StaticString("example value when not configured"),
+// 			},
+// 			"id": schema.StringAttribute{
+// 				Computed:            true,
+// 				MarkdownDescription: "Example identifier",
+// 				PlanModifiers: []planmodifier.String{
+// 					stringplanmodifier.UseStateForUnknown(),
+// 				},
+// 			},
+// 		},
+// 	}
+// }
 
 func (r *scorecardResource) Configure(ctx context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
 	// Prevent panic if the provider has not been configured.
