@@ -5,15 +5,13 @@ package provider
 
 import (
 	"context"
-	"net/http"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
-	// "github.com/hashicorp/terraform-plugin-framework/ephemeral"
-	// "github.com/hashicorp/terraform-plugin-framework/function"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
-	// "github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-provider-scaffolding-framework/internal/provider/dxapi"
 )
 
 // Ensure scorecardProvider satisfies various provider interfaces.
@@ -36,7 +34,7 @@ type scorecardProvider struct {
 	// version is set to the provider version on release, "dev" when the
 	// provider is built and ran locally, and "test" when running acceptance
 	// testing.
-	client *http.Client
+	client *dxapi.Client
 	token string
 	version string
 }
@@ -84,11 +82,11 @@ func (p *scorecardProvider) Configure(ctx context.Context, req provider.Configur
     }
 
     // Initialize HTTP client
-    client := &http.Client{}
+	baseURL := "https://api.dx.com"
+    client := dxapi.NewClient(baseURL, token)
 
     // Save for use in resources
     p.client = client
-    p.token = token
 }
 
 func (p *scorecardProvider) Resources(ctx context.Context) []func() resource.Resource {
@@ -97,16 +95,6 @@ func (p *scorecardProvider) Resources(ctx context.Context) []func() resource.Res
 	}
 }
 
-func (p *scorecardProvider) EphemeralResources(ctx context.Context) []func() ephemeral.EphemeralResource {
-	return nil
-}
-
 func (p *scorecardProvider) DataSources(ctx context.Context) []func() datasource.DataSource {
-	return []func() datasource.DataSource{
-		NewScorecardDataSource,
-	}
-}
-
-func (p *scorecardProvider) Functions(ctx context.Context) []func() function.Function {
 	return nil
 }
