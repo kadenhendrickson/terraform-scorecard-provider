@@ -6,12 +6,13 @@ package provider
 import (
 	"context"
 
+	"terraform-provider-scorecard/internal/provider/dxapi"
+
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
-	"github.com/hashicorp/terraform-provider-scaffolding-framework/internal/provider/dxapi"
 )
 
 // Ensure scorecardProvider satisfies various provider interfaces.
@@ -82,11 +83,13 @@ func (p *scorecardProvider) Configure(ctx context.Context, req provider.Configur
     }
 
     // Initialize HTTP client
-	baseURL := "https://api.dx.com"
+	baseURL := "https://api.getdx.com"
     client := dxapi.NewClient(baseURL, token)
+    // p.client = client
 
-    // Save for use in resources
-    p.client = client
+	resp.ResourceData = client
+	// Set if we create a data source
+	// resp.DataSourceData = client
 }
 
 func (p *scorecardProvider) Resources(ctx context.Context) []func() resource.Resource {

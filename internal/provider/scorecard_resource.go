@@ -5,19 +5,18 @@ package provider
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
+	"math/big"
+
+	"terraform-provider-scorecard/internal/provider/dxapi"
 
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/numberplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/numberplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
-	"github.com/hashicorp/terraform-provider-scaffolding-framework/internal/provider/dxapi"
 )
 
 // Ensure provider defined types fully satisfy framework interfaces.
@@ -32,10 +31,7 @@ func NewScorecardResource() resource.Resource {
 type scorecardResource struct {
 	client *dxapi.Client
 }
-type scorecardApiResponse struct {
-	Ok bool `json:"ok"`
-	Scorecard scorecardModel `json:"scorecard"`
-}
+
 // scorecardModel describes the resource data model.
 type scorecardModel struct {
 	// Required fields
@@ -43,7 +39,7 @@ type scorecardModel struct {
     Name        				types.String `tfsdk:"name"`
 	Type        				types.String `tfsdk:"type"`
 	EntityFilterType 			types.String `tfsdk:"entity_filter_type"`
-	EvaluationFrequency 		types.Number `tfsdk:"evaluation_frequency"`
+	EvaluationFrequency 		types.Number `tfsdk:"evaluation_frequency_hours"`
 	
 	// Conditionally required fields for levels based scorecards
 	EmptyLevelLabel 			types.String `tfsdk:"empty_level_label"`
@@ -115,7 +111,7 @@ func (r *scorecardResource) Configure(ctx context.Context, req resource.Configur
 		return
 	}
 
-	provider, ok := req.ProviderData.(*scorecardProvider)
+	client, ok := req.ProviderData.(*dxapi.Client)
 
 	if !ok {
 		resp.Diagnostics.AddError(
@@ -126,8 +122,11 @@ func (r *scorecardResource) Configure(ctx context.Context, req resource.Configur
 		return
 	}
 
-	r.client = provider.client
-
+	r.client = client
+	if r.client == nil {
+		resp.Diagnostics.AddError("Client not configured", "The API client was not configured. This is a bug in the provider.")
+		return
+	}
 }
 
 func (r *scorecardResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
@@ -169,7 +168,7 @@ func (r *scorecardResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 					stringplanmodifier.UseStateForUnknown(),
 				  },
 			},
-			"evaluation_frequency": schema.NumberAttribute{
+			"evaluation_frequency_hours": schema.NumberAttribute{
 				Required:    true,
 				Description: "How often the scorecard is evaluated (in hours). [2|4|8|24]",
 				// Validators: []validator.Number{
@@ -328,11 +327,11 @@ func (r *scorecardResource) Create(ctx context.Context, req resource.CreateReque
 		if plan.EmptyLevelColor.IsNull() || plan.EmptyLevelColor.IsUnknown() {
 			resp.Diagnostics.AddError("Missing required field", "The 'empty_level_color' field must be specified for LEVEL scorecards.")
 		}
-		if plan.Levels == nil || len(plan.Levels) == 0 {
+		if len(plan.Levels) == 0 {
 			resp.Diagnostics.AddError("Missing required field", "At least one 'level' must be specified for LEVEL scorecards.")
 		}
 	case "POINTS":
-		if plan.CheckGroups == nil || len(plan.CheckGroups) == 0 {
+		if len(plan.CheckGroups) == 0 {
 			resp.Diagnostics.AddError("Missing required field", "At least one 'check_group' must be specified for POINTS scorecards.")
 		}
 	default:
@@ -350,7 +349,7 @@ func (r *scorecardResource) Create(ctx context.Context, req resource.CreateReque
 		"name":                 plan.Name.ValueString(),
 		"type":                 scorecardType,
 		"entity_filter_type":   plan.EntityFilterType.ValueString(),
-		"evaluation_frequency": plan.EvaluationFrequency, // 2,4,8,24 values enforced by validator above
+		"evaluation_frequency_hours": plan.EvaluationFrequency.ValueBigFloat(),
 	}
 
 	// Add LEVEL-specific required fields
@@ -364,7 +363,7 @@ func (r *scorecardResource) Create(ctx context.Context, req resource.CreateReque
 				"key":   level.Key.ValueString(),
 				"name":  level.Name.ValueString(),
 				"color": level.Color.ValueString(),
-				"rank":  level.Rank,
+				"rank":  level.Rank.ValueBigFloat(),
 			})
 		}
 		payload["levels"] = levels
@@ -390,7 +389,7 @@ func (r *scorecardResource) Create(ctx context.Context, req resource.CreateReque
 	if !plan.Published.IsNull() && !plan.Published.IsUnknown() {
 		payload["published"] = plan.Published.ValueBool()
 	}
-	if plan.EntityFilterTypeIdentifiers != nil && len(plan.EntityFilterTypeIdentifiers) > 0 {
+	if len(plan.EntityFilterTypeIdentifiers) > 0 {
 		identifiers := make([]string, 0, len(plan.EntityFilterTypeIdentifiers))
 		for _, id := range plan.EntityFilterTypeIdentifiers {
 			if !id.IsNull() && !id.IsUnknown() {
@@ -427,9 +426,10 @@ func (r *scorecardResource) Create(ctx context.Context, req resource.CreateReque
 			checkPayload["scorecard_level_key"] = check.ScorecardLevelKey.ValueString()
 			checkPayload["level"] = map[string]interface{}{
 				"key":   check.Level.Key.ValueString(),
+				"id":    check.Level.Id.ValueString(),
 				"name":  check.Level.Name.ValueString(),
 				"color": check.Level.Color.ValueString(),
-				"rank":  check.Level.Rank,
+				"rank":  check.Level.Rank.ValueBigFloat(),
 			}
 		}
 
@@ -448,64 +448,170 @@ func (r *scorecardResource) Create(ctx context.Context, req resource.CreateReque
 	}
 	payload["checks"] = checks
 
-	// Create Scorecard
+	// Create Scorecard (apiResp is a struct of type APIResponse)
 	apiResp, err := r.client.CreateScorecard(ctx, payload)
 	if err != nil {
 		resp.Diagnostics.AddError("Error creating scorecard", err.Error())
 		return
 	}
-	defer apiResp.Body.Close()
-
-	if apiResp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(apiResp.Body)
-		resp.Diagnostics.AddError("Error creating scorecard", fmt.Sprintf("Unexpected status code: %d, response body: %s", apiResp.StatusCode, string(body)))
-		return
-	}
-
-	var response scorecardApiResponse
-	if err := json.NewDecoder(apiResp.Body).Decode(&response); err != nil {
-		resp.Diagnostics.AddError("Error decoding scorecard response", err.Error())
-		return
-	}
-
-	// Set Scorecard ID
-	plan.Id = response.Scorecard.Id
-
-	// TODO - Are names the best way to match here? I don't think so....
-	// Set Level IDs
-	for i := range plan.Levels {
-		for _, apiResponseLevel := range response.Scorecard.Levels {
-			if plan.Levels[i].Name == apiResponseLevel.Name {
-				plan.Levels[i].Id = apiResponseLevel.Id
-				break
-			}
-		}
-	}
-
-	// Set Check IDs
-	for i := range plan.Checks {
-		for _, apiResponseCheck := range response.Scorecard.Checks {
-			if plan.Checks[i].Name == apiResponseCheck.Name {
-				plan.Checks[i].Id = apiResponseCheck.Id
-				break
-			}
-		}
-	}
-
-	// Set Check Group IDs	
-	for i := range plan.CheckGroups {
-		for _, apiResponseCheckGroup := range response.Scorecard.CheckGroups {
-			if plan.CheckGroups[i].Name == apiResponseCheckGroup.Name {
-				plan.CheckGroups[i].Id = apiResponseCheckGroup.Id
-				break
-			}
-		}
-	}
+	
+	// Shallow copy of plan to preserve values
+	oldPlan := plan
+	mapApiResponseToTerraformModel(apiResp, &plan, &oldPlan)
 
 	diags = resp.State.Set(ctx, plan)
 	resp.Diagnostics.Append(diags...)
 }
 
+func mapApiResponseToTerraformModel(apiResp *dxapi.APIResponse, plan *scorecardModel, oldPlan *scorecardModel) {
+	
+	// ************** Helper functions **************
+
+	// Helper checks for and handles nil strings
+	stringOrNull := func(s *string) types.String {
+		if s != nil {
+			return types.StringValue(*s)
+		}
+		return types.StringNull() 
+	}
+
+	// Helper preserves the value of a bool field if it's null in the plan
+	boolApiToTF := func(apiVal bool, planVal types.Bool) types.Bool {
+		if planVal.IsNull() && !apiVal {
+			return types.BoolNull()
+		}
+		return types.BoolValue(apiVal)
+	}
+
+	// Helper checks for and handles nil ints
+	numberOrNull := func(n *int) types.Number {
+		if n != nil {
+			return types.NumberValue(big.NewFloat(float64(*n)))
+		}
+		return types.NumberNull()
+	}
+
+	// ************** Required fields **************
+	plan.Id = types.StringValue(apiResp.Scorecard.Id)
+	plan.Name = types.StringValue(apiResp.Scorecard.Name)
+	plan.Type = types.StringValue(apiResp.Scorecard.Type)
+	plan.EntityFilterType = types.StringValue(apiResp.Scorecard.EntityFilterType)
+	plan.EvaluationFrequency = types.NumberValue(big.NewFloat(float64(apiResp.Scorecard.EvaluationFrequency)))
+
+	// ************** Conditionally required fields for levels based scorecards **************
+	plan.EmptyLevelLabel = stringOrNull(apiResp.Scorecard.EmptyLevelLabel)
+	plan.EmptyLevelColor = stringOrNull(apiResp.Scorecard.EmptyLevelColor)
+
+	// If there are levels in the API response, update the plan.Levels
+	if len(apiResp.Scorecard.Levels) > 0 {
+
+		plan.Levels = make([]levelModel, len(apiResp.Scorecard.Levels))
+		for i, lvl := range apiResp.Scorecard.Levels {
+			var oldLevel levelModel
+			if i < len(oldPlan.Levels) {
+				oldLevel = oldPlan.Levels[i]
+			}
+			plan.Levels[i] = levelModel{
+				// Key not returned by API. Leave same as plan.
+				Key:   oldLevel.Key,
+				Id:    stringOrNull(lvl.Id),
+				Name:  stringOrNull(lvl.Name),
+				Color: stringOrNull(lvl.Color),
+				Rank:  numberOrNull(lvl.Rank),
+			}
+		}
+	} else {
+		plan.Levels = oldPlan.Levels
+	}
+
+	// ************** Conditionally required fields for points based scorecards **************
+
+	// If there are check groups in the API response, update the plan.CheckGroups
+	if len(apiResp.Scorecard.CheckGroups) > 0 {
+
+		plan.CheckGroups = make([]checkGroupModel, len(apiResp.Scorecard.CheckGroups))
+		for i, grp := range apiResp.Scorecard.CheckGroups {
+			var prevCheckGroup checkGroupModel
+			if i < len(oldPlan.CheckGroups) {
+				prevCheckGroup = oldPlan.CheckGroups[i]
+			}
+			plan.CheckGroups[i] = checkGroupModel{
+				// Key not returned by API. Leave same as plan.
+				Key:      prevCheckGroup.Key,
+				Id:       stringOrNull(grp.Id),
+				Name:     stringOrNull(grp.Name),
+				Ordering: numberOrNull(grp.Ordering),
+			}
+		}
+	} else {
+		plan.CheckGroups = oldPlan.CheckGroups
+	}
+	
+	// ************** Optional fields **************
+	plan.Description = stringOrNull(apiResp.Scorecard.Description)
+	plan.EntityFilterSql = stringOrNull(apiResp.Scorecard.EntityFilterSql)
+	plan.Published = boolApiToTF(apiResp.Scorecard.Published, plan.Published)
+
+	// If there are entity filter type identifiers, update the plan.EntityFilterTypeIdentifiers
+	if len(apiResp.Scorecard.EntityFilterTypeIdentifiers) > 0 {
+		identifiers := make([]types.String, len(apiResp.Scorecard.EntityFilterTypeIdentifiers))
+		for i, id := range apiResp.Scorecard.EntityFilterTypeIdentifiers {
+			identifiers[i] = stringOrNull(id)
+		}
+		plan.EntityFilterTypeIdentifiers = identifiers
+	} else {
+		plan.EntityFilterTypeIdentifiers = oldPlan.EntityFilterTypeIdentifiers
+	}
+	
+	// If there are checks in the API response, update the plan.Checks
+	if len(apiResp.Scorecard.Checks) > 0 {
+		plan.Checks = make([]checkModel, len(apiResp.Scorecard.Checks))
+		for i, chk := range apiResp.Scorecard.Checks {
+			var prevCheck checkModel
+			if i < len(oldPlan.Checks) {
+				prevCheck = oldPlan.Checks[i]
+			}
+			plan.Checks[i] = checkModel{
+				Id:              stringOrNull(chk.Id),
+				Name:            stringOrNull(chk.Name),
+				Description:     stringOrNull(chk.Description),
+				Ordering:        numberOrNull(chk.Ordering),
+				Sql:             stringOrNull(chk.Sql),
+				FilterSql:       stringOrNull(chk.FilterSql),
+				FilterMessage:   stringOrNull(chk.FilterMessage),
+				OutputEnabled:   boolApiToTF(chk.OutputEnabled, plan.Checks[i].OutputEnabled),
+				OutputType:      stringOrNull(chk.OutputType),
+				OutputAggregation: stringOrNull(chk.OutputAggregation),
+				OutputCustomOptions: stringOrNull(chk.OutputCustomOptions),
+				EstimatedDevDays: numberOrNull(chk.EstimatedDevDays),
+				ExternalUrl:     stringOrNull(chk.ExternalUrl),
+				Published:       boolApiToTF(chk.Published, plan.Checks[i].Published),
+				// Key not returned by API. Leave same as plan.
+				ScorecardLevelKey: prevCheck.ScorecardLevelKey,
+				Level: levelModel{
+					// Key not returned by API. Leave same as plan.
+					Key:   prevCheck.Level.Key,
+					Id:    stringOrNull(chk.Level.Id),
+					Name:  stringOrNull(chk.Level.Name),
+					Color: stringOrNull(chk.Level.Color),
+					Rank:  numberOrNull(chk.Level.Rank),
+				},
+				// Key not returned by API. Leave same as plan.
+				ScorecardCheckGroupKey: prevCheck.ScorecardCheckGroupKey,
+				CheckGroup: checkGroupModel{
+					// Key not returned by API. Leave same as plan.
+					Key:      prevCheck.CheckGroup.Key,
+					Id:       stringOrNull(chk.CheckGroup.Id),
+					Name:     stringOrNull(chk.CheckGroup.Name),
+					Ordering: numberOrNull(chk.CheckGroup.Ordering),
+				},
+				Points: numberOrNull(chk.Points),
+			}
+		}
+	} else {
+		plan.Checks = oldPlan.Checks
+	}
+}
 
 func (r *scorecardResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 	var state scorecardModel
@@ -538,44 +644,18 @@ func (r *scorecardResource) Read(ctx context.Context, req resource.ReadRequest, 
 		)
 		return
 	}
-	defer apiResp.Body.Close()
-
-	if apiResp.StatusCode == http.StatusNotFound {
-		resp.State.RemoveResource(ctx)
-		return
-	}
-
-	if apiResp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(apiResp.Body)
-		resp.Diagnostics.AddError("Error reading scorecard", fmt.Sprintf("Unexpected status code: %d, response body: %s", apiResp.StatusCode, string(body)))
-		return
-	}
-
-	var response scorecardApiResponse // or a more appropriate struct for GET
-	if err := json.NewDecoder(apiResp.Body).Decode(&response); err != nil {
-		resp.Diagnostics.AddError("Error decoding scorecard response", err.Error())
-		return
-	}
 
 	// Map API response to Terraform state model
-	state.Id = response.Scorecard.Id
-	state.Name = response.Scorecard.Name
-	state.Description = response.Scorecard.Description
+	// Shallow copy of plan to preserve values
+	oldState := state
+	mapApiResponseToTerraformModel(apiResp, &state, &oldState)
+	// state.Id = types.StringValue(apiResp.Scorecard.Id)
+	// state.Name = types.StringValue(apiResp.Scorecard.Name)
+	// // state.Description = types.StringValue(apiResp.Scorecard.Description)
+	// state.Type = types.StringValue(apiResp.Scorecard.Type)
+	// Map other fields as needed
+	// ...
 
-	if response.Scorecard.Type == types.StringValue("LEVEL") {
-		state.Type = types.StringValue("LEVEL")
-		// state.Levels = flattenLevels(response.Scorecard.Levels) // implement this
-		// state.Points = nil
-	} else if response.Scorecard.Type == types.StringValue("POINTS") {
-		state.Type = types.StringValue("POINTS")
-		// state.Points = flattenPoints(response.Scorecard.Points) // implement this
-		state.Levels = nil
-	}
-
-	// state.Checks = flattenChecks(response.Scorecard.Checks)               // implement this
-	// state.CheckGroups = flattenCheckGroups(response.Scorecard.CheckGroups) // implement this
-
-	// Save updated state
 	diags = resp.State.Set(ctx, &state)
 	resp.Diagnostics.Append(diags...)
 }
@@ -594,7 +674,7 @@ func (r *scorecardResource) Update(ctx context.Context, req resource.UpdateReque
 		"name": plan.Name.ValueString(),
 		"type": plan.Type.ValueString(),
 		"entity_filter_type": plan.EntityFilterType.ValueString(),
-		"evaluation_frequency": plan.EvaluationFrequency,
+		"evaluation_frequency_hours": plan.EvaluationFrequency.ValueBigFloat(),
 	}
 
 	scorecardType := plan.Type.ValueString()
@@ -608,7 +688,7 @@ func (r *scorecardResource) Update(ctx context.Context, req resource.UpdateReque
 				"id":    level.Id.ValueString(),
 				"name":  level.Name.ValueString(),
 				"color": level.Color.ValueString(),
-				"rank":  level.Rank,
+				"rank":  level.Rank.ValueBigFloat(),
 			})
 		}
 		payload["levels"] = levels
@@ -631,7 +711,7 @@ func (r *scorecardResource) Update(ctx context.Context, req resource.UpdateReque
 	if !plan.Published.IsNull() && !plan.Published.IsUnknown() {
 		payload["published"] = plan.Published.ValueBool()
 	}
-	if plan.EntityFilterTypeIdentifiers != nil && len(plan.EntityFilterTypeIdentifiers) > 0 {
+	if len(plan.EntityFilterTypeIdentifiers) > 0 {
 		identifiers := make([]string, 0, len(plan.EntityFilterTypeIdentifiers))
 		for _, id := range plan.EntityFilterTypeIdentifiers {
 			if !id.IsNull() && !id.IsUnknown() {
@@ -668,7 +748,7 @@ func (r *scorecardResource) Update(ctx context.Context, req resource.UpdateReque
 				"id":    check.Level.Id.ValueString(),
 				"name":  check.Level.Name.ValueString(),
 				"color": check.Level.Color.ValueString(),
-				"rank":  check.Level.Rank,
+				"rank":  check.Level.Rank.ValueBigFloat(),
 			}
 		}
 		if scorecardType == "POINTS" {
@@ -690,20 +770,11 @@ func (r *scorecardResource) Update(ctx context.Context, req resource.UpdateReque
 		resp.Diagnostics.AddError("Error updating scorecard", err.Error())
 		return
 	}
-	defer apiResp.Body.Close()
 
-	if apiResp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(apiResp.Body)
-		resp.Diagnostics.AddError("Error updating scorecard", fmt.Sprintf("Unexpected status code: %d, response body: %s", apiResp.StatusCode, string(body)))
-		return
-	}
+	oldPlan := plan
+	mapApiResponseToTerraformModel(apiResp, &plan, &oldPlan)
 
-	var response scorecardApiResponse
-	if err := json.NewDecoder(apiResp.Body).Decode(&response); err != nil {
-		resp.Diagnostics.AddError("Error decoding scorecard response", err.Error())
-		return
-	}
-
+	// Map API response to Terraform state model
 
 	diags := resp.State.Set(ctx, plan)
 	resp.Diagnostics.Append(diags...)
@@ -722,19 +793,15 @@ func (r *scorecardResource) Delete(ctx context.Context, req resource.DeleteReque
 		return
 	}
 
-	apiResp, err := r.client.DeleteScorecard(ctx, id)
+	success, err := r.client.DeleteScorecard(ctx, id)
 	if err != nil {
 		resp.Diagnostics.AddError("Error deleting scorecard", err.Error())
 		return
 	}
-	defer apiResp.Body.Close()
-
-	if apiResp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(apiResp.Body)
-		resp.Diagnostics.AddError("Error deleting scorecard", fmt.Sprintf("Unexpected status code: %d, response body: %s", apiResp.StatusCode, string(body)))
+	if !success {
+		resp.Diagnostics.AddError("Error deleting scorecard", "API did not confirm deletion.")
 		return
 	}
-
 	// No need to set state, resource will be removed by Terraform if this method returns successfully
 }
 

@@ -1,3 +1,7 @@
-resource "scaffolding_example" "example" {
+resource "scorecard" "example" {
   configurable_attribute = "some-value"
+
+
+
+  
 }
